@@ -66,34 +66,7 @@ void AabbWorld::OnAdopt(Body& b) {
     b.w = {};
 }
 
-void AabbWorld::UpdateBody(Body& b, float) {
-    const float lo[3] = {-W, 0, -D}, hi[3] = {W, H, D};
-    for (int i = 0; i < 3; ++i) {
-        for (int side = 0; side < 2; ++side) {
-            float h = Comp(b.half, i);
-            float p = Comp(b.pos, i), v = Comp(b.vel, i);
-            float limit = side == 0 ? lo[i] + h : hi[i] - h;
-            bool hit = side == 0 ? p < limit : p > limit;
-            if (!hit) continue;
-            SetComp(b.pos, i, limit);
-            bool into = side == 0 ? v < 0 : v > 0;
-            if (!into) continue;
-            float vn = std::fabs(v);
-            float e = vn > 1.0f ? kRestitution : 0.0f;
-            SetComp(b.vel, i, -v * e);
-            // Coulomb friction on the tangential components
-            float jn = (1 + e) * vn;
-            int t1 = (i + 1) % 3, t2 = (i + 2) % 3;
-            float a = Comp(b.vel, t1), c = Comp(b.vel, t2);
-            float tl = std::sqrt(a * a + c * c);
-            if (tl > 1e-6f) {
-                float f = std::min(tl, kFriction * jn) / tl;
-                SetComp(b.vel, t1, a * (1 - f));
-                SetComp(b.vel, t2, c * (1 - f));
-            }
-        }
-    }
-}
+void AabbWorld::UpdateBody(Body& b, float) { BounceOffWalls(b, b.half); }
 
 void AabbWorld::Resolve(Body& a, Body& b) {
     Vec3 n;

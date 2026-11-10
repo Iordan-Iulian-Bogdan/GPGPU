@@ -1,5 +1,6 @@
 #pragma once
 // Constants and small helpers shared by the collision models (internal to the physics code).
+#include <algorithm>
 #include <cmath>
 #include "Physics.h"
 
@@ -25,5 +26,35 @@ inline bool SphereSphere(const Body& a, const Body& b, Vec3& n, float& depth) {
     n = dist > 1e-6f ? d * (1.0f / dist) : Vec3(0, 1, 0);
     depth = r - dist;
     return true;
+}
+// Keeps the body inside the box (axis-aligned walls); "half" is the body's extent along each world axis.
+// Bounces with restitution and applies Coulomb friction on the tangential velocity.
+inline void BounceOffWalls(Body& b, Vec3 half) {
+    const float lo[3] = {-World::W, 0, -World::D}, hi[3] = {World::W, World::H, World::D};
+    for (int i = 0; i < 3; ++i) {
+        for (int side = 0; side < 2; ++side) {
+            float h = Comp(half, i);
+            float p = Comp(b.pos, i), v = Comp(b.vel, i);
+            float limit = side == 0 ? lo[i] + h : hi[i] - h;
+            bool hit = side == 0 ? p < limit : p > limit;
+            if (!hit) continue;
+            SetComp(b.pos, i, limit);
+            bool into = side == 0 ? v < 0 : v > 0;
+            if (!into) continue;
+            float vn = std::fabs(v);
+            float e = vn > 1.0f ? kRestitution : 0.0f;
+            SetComp(b.vel, i, -v * e);
+            // Coulomb friction on the tangential components
+            float jn = (1 + e) * vn;
+            int t1 = (i + 1) % 3, t2 = (i + 2) % 3;
+            float a = Comp(b.vel, t1), c = Comp(b.vel, t2);
+            float tl = std::sqrt(a * a + c * c);
+            if (tl > 1e-6f) {
+                float f = std::min(tl, kFriction * jn) / tl;
+                SetComp(b.vel, t1, a * (1 - f));
+                SetComp(b.vel, t2, c * (1 - f));
+            }
+        }
+    }
 }
 }  // namespace phys
