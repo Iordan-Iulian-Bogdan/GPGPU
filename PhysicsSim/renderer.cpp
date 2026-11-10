@@ -25,6 +25,9 @@ struct VSInput
     float4 instancePosition : INSTPOS;
     float4 instanceScale    : INSTSCL;
     float4 instanceColor    : INSTCOL;
+    float4 axisX : INSTAX;
+    float4 axisY : INSTAY;
+    float4 axisZ : INSTAZ;
 };
 
 struct VSOutput
@@ -37,9 +40,12 @@ struct VSOutput
 VSOutput VS(VSInput input)
 {
     VSOutput output;
-    float3 world = input.position * input.instanceScale.xyz + input.instancePosition.xyz;
+    float3 local = input.position * input.instanceScale.xyz;
+    float3 world = local.x * input.axisX.xyz + local.y * input.axisY.xyz + local.z * input.axisZ.xyz
+                 + input.instancePosition.xyz;
     output.position = mul(float4(world, 1), viewProjection);
-    output.normal = normalize(input.normal / input.instanceScale.xyz);
+    float3 n = input.normal / input.instanceScale.xyz;
+    output.normal = normalize(n.x * input.axisX.xyz + n.y * input.axisY.xyz + n.z * input.axisZ.xyz);
     output.color = input.instanceColor;
     return output;
 }
@@ -197,6 +203,9 @@ bool Renderer::Init(HWND window, int w, int h)
         { "INSTPOS",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, position), D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
         { "INSTSCL",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, scale),    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
         { "INSTCOL",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, color),    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTAX",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, axisX),    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTAY",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, axisY),    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTAZ",   0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, offsetof(Instance, axisZ),    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};

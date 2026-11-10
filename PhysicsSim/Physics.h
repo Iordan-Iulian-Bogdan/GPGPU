@@ -13,6 +13,10 @@ struct Body {
     Vec3 color;
     Shape shape;
     float invMass;
+    // Rotation (used only in OBB mode; in AABB mode the axes stay identity and w stays 0).
+    Vec3 ax[3] = { {1, 0, 0}, {0, 1, 0}, {0, 0, 1} };   // orientation: local axes in world space
+    Vec3 w;                                             // angular velocity (world space)
+    Vec3 invI;                                          // inverse inertia, diagonal, in local axes
 };
 
 class World {
@@ -32,8 +36,13 @@ public:
     const std::vector<Body>& Bodies() const { return bodies_; }
     void SetParallel(bool on) { parallel_ = on; }
     bool Parallel() const { return parallel_; }
+    // Collision mode: false = AABB (axis-aligned, no rotation), true = OBB (oriented boxes, bodies rotate).
+    void SetObb(bool on);
+    bool Obb() const { return obb_; }
 
 private:
+    void CollideWallsObb(Body& b);
+    void ResolveObb(Body& a, Body& b);
     void AddBody(Shape s, Vec3 pos, Vec3 vel);
     void SubStep(float h);
     void CollideWalls(Body& b);
@@ -43,5 +52,6 @@ private:
     // uniform grid for the broad phase
     std::vector<int> head_, next_;    std::mt19937 rng_;
     bool parallel_ = true;   // OpenMP on/off, switchable at runtime
+    bool obb_ = false;       // AABB / OBB collision mode, switchable at runtime
     float Rand(float lo, float hi) { return std::uniform_real_distribution<float>(lo, hi)(rng_); }
 };

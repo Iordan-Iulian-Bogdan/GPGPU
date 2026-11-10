@@ -114,6 +114,7 @@ int main()
         "  K         kick: give random motion to all objects (wakes a settled scene)\n"
         "  C         clear the box\n"
         "  F1/F2/F3  predefined modes: 100/250/500, 250/500/1000, 500/1000/2500 (sphere/cube/cyl+cone)\n"
+        "  O         toggle collision mode: AABB (no rotation) / OBB (oriented boxes, bodies rotate)\n"
         "  T         toggle OpenMP on/off (collision pass)\n"
         "  V         toggle VSync on/off\n"
         "  P         pause   |  Esc: quit\n");
@@ -199,6 +200,7 @@ int main()
         if (input.WasPressed('C')) world.Clear();
         if (input.WasPressed('P')) paused = !paused;
         if (input.WasPressed('T')) world.SetParallel(!world.Parallel());
+        if (input.WasPressed('O')) world.SetObb(!world.Obb());
         if (input.WasPressed('V')) renderer.SetVsync(!renderer.Vsync());
         for (UINT key = VK_F1; key <= VK_F3; key++)
             if (input.WasPressed(key)) world.LoadPreset(key - VK_F1);
@@ -230,8 +232,8 @@ int main()
         if (fpsTimer >= 0.5f)
         {
             wchar_t title[256];
-            swprintf_s(title, L"Etapa 1 - CPU Physics (OpenMP %s, VSync %s) | objects: %zu | FPS: %.1f | physics: %.2f ms/frame%s",
-                       world.Parallel() ? L"ON" : L"OFF", renderer.Vsync() ? L"ON" : L"OFF", world.Bodies().size(),
+            swprintf_s(title, L"Etapa 1 - CPU Physics (%s, OpenMP %s, VSync %s) | objects: %zu | FPS: %.1f | physics: %.2f ms/frame%s",
+                       world.Obb() ? L"OBB" : L"AABB", world.Parallel() ? L"ON" : L"OFF", renderer.Vsync() ? L"ON" : L"OFF", world.Bodies().size(),
                        fpsFrames / fpsTimer, physicsMs / fpsFrames, paused ? L" | PAUSED" : L"");
             SetWindowTextW(hwnd, title);
             fpsTimer = 0;
