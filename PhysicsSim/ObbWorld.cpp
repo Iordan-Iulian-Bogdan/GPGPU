@@ -1,4 +1,5 @@
 // Simplest OBB model: 15-axis SAT, one contact point per pair, walls treated as axis-aligned.
+// Cones are approximated by three spheres along their axis; every other shape collides as an oriented box.
 #include "ObbWorld.h"
 #include <algorithm>
 #include "PhysicsCommon.h"
@@ -22,9 +23,37 @@ void Rotate(Body& b, float h) {
     b.ax[2] = Cross(b.ax[0], b.ax[1]);
 }
 
-// Extent of the oriented box along each world axis (what its AABB would be).
+// A cone is approximated by three spheres on its axis, each fitting inside the cone (base at local y = -h,
+// apex at y = +h). The first is the largest sphere touching both the base and the side, the others shrink
+// towards the tip. c = centre height along the axis, s = radius.
+struct ConeSpheres {
+    float c[3], s[3];
+};
+
+ConeSpheres MakeConeSpheres(const Body& b) {
+    const float r = b.half.x, h = b.half.y, L = std::sqrt(r * r + 4 * h * h);
+    ConeSpheres cs;
+    cs.s[0] = 2 * h * r / (L + r);
+    cs.c[0] = -h + cs.s[0];
+    cs.c[1] = 0.0f;
+    cs.s[1] = r * (h - cs.c[1]) / L;
+    cs.c[2] = 0.45f * h;
+    cs.s[2] = r * (h - cs.c[2]) / L;
+    return cs;
+}
+
+// Extent of the body along each world axis (what its AABB would be).
 Vec3 WorldExtent(const Body& b) {
     Vec3 e;
+    if (b.shape == Shape::Cone) {
+        ConeSpheres cs = MakeConeSpheres(b);
+        for (int i = 0; i < 3; ++i) {
+            float m = 0;
+            for (int k = 0; k < 3; ++k) m = std::max(m, std::fabs(Comp(b.ax[1], i) * cs.c[k]) + cs.s[k]);
+            SetComp(e, i, m);
+        }
+        return e;
+    }
     for (int i = 0; i < 3; ++i)
         SetComp(e, i, b.half.x * std::fabs(Comp(b.ax[0], i)) + b.half.y * std::fabs(Comp(b.ax[1], i)) +
                           b.half.z * std::fabs(Comp(b.ax[2], i)));
@@ -128,6 +157,23 @@ bool Narrow(const Body& a, const Body& b, Contact& c) {
     return true;
 }
 
+// The collision parts of a body: a cone gives its three spheres (written into tmp), anything else is a
+// single part, the body itself. Returns the number of parts.
+int Parts(const Body& body, Body tmp[3], const Body* out[3]) {
+    if (body.shape != Shape::Cone) {
+        out[0] = &body;
+        return 1;
+    }
+    ConeSpheres cs = MakeConeSpheres(body);
+    for (int k = 0; k < 3; ++k) {
+        tmp[k].shape = Shape::Sphere;
+        tmp[k].pos = body.pos + body.ax[1] * cs.c[k];
+        tmp[k].half = {cs.s[k], cs.s[k], cs.s[k]};
+        out[k] = &tmp[k];
+    }
+    return 3;
+}
+
 // Impulse at the contact point p: linear response plus torque (r x J), with Coulomb friction.
 void ContactImpulse(Body& a, Body& b, Vec3 n, Vec3 p) {
     const Vec3 ra = p - a.pos, rb = p - b.pos;
@@ -178,8 +224,21 @@ void ObbWorld::Resolve(Body& a, Body& b) {
     float r = Length(a.half) + Length(b.half);
     if (Dot(d, d) >= r * r) return;
 
+    // test every part of a against every part of b and keep the deepest contact
+    Body tmpA[3], tmpB[3];
+    const Body *partsA[3], *partsB[3];
+    int na = Parts(a, tmpA, partsA), nb = Parts(b, tmpB, partsB);
     Contact c;
-    if (!Narrow(a, b, c)) return;
+    bool hit = false;
+    for (int i = 0; i < na; ++i)
+        for (int j = 0; j < nb; ++j) {
+            Contact t;
+            if (Narrow(*partsA[i], *partsB[j], t) && (!hit || t.depth > c.depth)) {
+                c = t;
+                hit = true;
+            }
+        }
+    if (!hit) return;
     SeparateBodies(a, b, c.n, c.depth);
     ContactImpulse(a, b, c.n, c.p);
 }
