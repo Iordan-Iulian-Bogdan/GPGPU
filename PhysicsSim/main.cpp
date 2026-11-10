@@ -1,4 +1,6 @@
 // Etapa 1 - Prototip 1: 3D Virtual World Physics (CPU), rendered with the MG3D Direct3D 12 renderer.
+#include "AabbWorld.h"
+#include "ObbWorld.h"
 #include "Physics.h"
 #include "camera.h"
 #include "importer.h"
@@ -10,6 +12,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <vector>
 
 namespace
@@ -160,8 +163,9 @@ int main()
 
     ShowWindow(hwnd, SW_SHOW);
 
-    World world;
-    world.LoadPreset(0);
+    // The collision model is a subclass of World; "O" swaps it at runtime and carries the bodies over.
+    std::unique_ptr<World> world = std::make_unique<AabbWorld>();
+    world->LoadPreset(0);
     std::vector<Instance> instances[4];
     bool paused = false;
 
@@ -195,15 +199,22 @@ int main()
             DestroyWindow(hwnd);
         if (input.WasPressed('E'))
             for (int i = 0; i < 10; i++)
-                world.Spawn(static_cast<Shape>(i % 4), true);
-        if (input.WasPressed('K')) world.Kick();
-        if (input.WasPressed('C')) world.Clear();
+                world->Spawn(static_cast<Shape>(i % 4), true);
+        if (input.WasPressed('K')) world->Kick();
+        if (input.WasPressed('C')) world->Clear();
         if (input.WasPressed('P')) paused = !paused;
-        if (input.WasPressed('T')) world.SetParallel(!world.Parallel());
-        if (input.WasPressed('O')) world.SetObb(!world.Obb());
+        if (input.WasPressed('T')) world->SetParallel(!world->Parallel());
+        if (input.WasPressed('O'))
+        {
+            std::unique_ptr<World> next;
+            if (world->Obb()) next = std::make_unique<AabbWorld>();
+            else next = std::make_unique<ObbWorld>();
+            next->AdoptState(*world);
+            world = std::move(next);
+        }
         if (input.WasPressed('V')) renderer.SetVsync(!renderer.Vsync());
         for (UINT key = VK_F1; key <= VK_F3; key++)
-            if (input.WasPressed(key)) world.LoadPreset(key - VK_F1);
+            if (input.WasPressed(key)) world->LoadPreset(key - VK_F1);
 
         camera.Update(input, dt);
 
@@ -211,12 +222,12 @@ int main()
         {
             LARGE_INTEGER start, end;
             QueryPerformanceCounter(&start);
-            world.Step(1.0f / 60.0f);
+            world->Step(1.0f / 60.0f);
             QueryPerformanceCounter(&end);
             physicsMs += 1000.0 * (end.QuadPart - start.QuadPart) / frequency.QuadPart;
         }
 
-        world.BuildInstances(instances);
+        world->BuildInstances(instances);
         Mat4 projection = Perspective(ToRadians(60.0f), renderer.AspectRatio(), 0.1f, 300.0f);
         Mat4 viewProjection = camera.ViewMatrix() * projection;
 
@@ -233,7 +244,7 @@ int main()
         {
             wchar_t title[256];
             swprintf_s(title, L"Etapa 1 - CPU Physics (%s, OpenMP %s, VSync %s) | objects: %zu | FPS: %.1f | physics: %.2f ms/frame%s",
-                       world.Obb() ? L"OBB" : L"AABB", world.Parallel() ? L"ON" : L"OFF", renderer.Vsync() ? L"ON" : L"OFF", world.Bodies().size(),
+                       world->Obb() ? L"OBB" : L"AABB", world->Parallel() ? L"ON" : L"OFF", renderer.Vsync() ? L"ON" : L"OFF", world->Bodies().size(),
                        fpsFrames / fpsTimer, physicsMs / fpsFrames, paused ? L" | PAUSED" : L"");
             SetWindowTextW(hwnd, title);
             fpsTimer = 0;
