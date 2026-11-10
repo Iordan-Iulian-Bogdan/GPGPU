@@ -1,0 +1,6 @@
+bin/
+obj/
+.vs/
+vcpkg_installed/
+*.user
+PhysicsSim/assets/*.mg3dmesh
