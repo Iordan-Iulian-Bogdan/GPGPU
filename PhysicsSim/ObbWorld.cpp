@@ -1,7 +1,8 @@
 // Simplest OBB model: 15-axis SAT, one contact point per pair, walls treated as axis-aligned.
-// Cones are approximated by three spheres along their axis; every other shape collides as an oriented box.
+// Cones and cylinders are approximated by a few boxes; spheres stay spheres; cubes are oriented boxes.
 #include "ObbWorld.h"
 #include <algorithm>
+#include <array>
 #include "PhysicsCommon.h"
 
 using namespace phys;
@@ -23,45 +24,79 @@ void Rotate(Body& b, float h) {
     b.ax[2] = Cross(b.ax[0], b.ax[1]);
 }
 
-// A cone is approximated by three spheres on its axis, each fitting inside the cone (base at local y = -h,
-// apex at y = +h). The first is the largest sphere touching both the base and the side, the others shrink
-// towards the tip. c = centre height along the axis, s = radius.
-struct ConeSpheres {
-    float c[3], s[3];
+// A collision primitive: an oriented box, or a sphere (radius = half.x) when `sphere` is set.
+// Deliberately without default initialisers so that big arrays of them cost nothing to create.
+struct Box {
+    Vec3 pos, half, ax[3];
+    bool sphere;
 };
 
-ConeSpheres MakeConeSpheres(const Body& b) {
-    const float r = b.half.x, h = b.half.y, L = std::sqrt(r * r + 4 * h * h);
-    ConeSpheres cs;
-    cs.s[0] = 2 * h * r / (L + r);
-    cs.c[0] = -h + cs.s[0];
-    cs.c[1] = 0.0f;
-    cs.s[1] = r * (h - cs.c[1]) / L;
-    cs.c[2] = 0.45f * h;
-    cs.s[2] = r * (h - cs.c[2]) / L;
-    return cs;
+Box ToBox(const Body& b) { return {b.pos, b.half, {b.ax[0], b.ax[1], b.ax[2]}, b.shape == Shape::Sphere}; }
+
+// Cones and cylinders are approximated by boxes that sit inside the shape, aligned with its axis (local y):
+//  - cone: a voxel grid. kConeLayers layers along the axis, each a kConeGrid x kConeGrid grid of cubes; a cube is
+//    kept when its centre lies within the cone's radius at that layer's mid height
+//  - cylinder: thin bars fanned evenly about the axis (a star-shaped footprint that fills the circle)
+constexpr int kConeLayers = 4, kConeGrid = 4, kCylinderBars = 8;
+constexpr int kMaxParts = std::max(kConeLayers * kConeGrid * kConeGrid, kCylinderBars);
+
+// The collision primitives of one body. Anything that is not a cone or cylinder is a single part.
+struct Parts {
+    std::array<Box, kMaxParts> box;
+    int count = 0;
+};
+
+Parts MakeParts(const Body& body) {
+    Parts p;
+    const float r = body.half.x, h = body.half.y;
+    if (body.shape == Shape::Cone) {
+        const float cell = r / kConeGrid, layerH = h / kConeLayers;   // half sizes of one voxel
+        for (int ly = 0; ly < kConeLayers; ++ly) {
+            const float yc = -h + layerH * (2 * ly + 1);
+            const float rad = r * (h - yc) / (2 * h);   // cone radius at the layer's mid height
+            for (int i = 0; i < kConeGrid; ++i)
+                for (int j = 0; j < kConeGrid; ++j) {
+                    const float x = (2 * i + 1 - kConeGrid) * cell, z = (2 * j + 1 - kConeGrid) * cell;
+                    if (x * x + z * z > rad * rad) continue;
+                    p.box[p.count++] = {body.pos + body.ax[0] * x + body.ax[1] * yc + body.ax[2] * z,
+                                        {cell, layerH, cell},
+                                        {body.ax[0], body.ax[1], body.ax[2]},
+                                        false};
+                }
+        }
+    } else if (body.shape == Shape::Cylinder) {
+        for (int k = 0; k < kCylinderBars; ++k) {
+            const float ang = kPi * k / kCylinderBars, cs = std::cos(ang), sn = std::sin(ang);   // fanned over 180 degrees
+            p.box[p.count++] = {body.pos,
+                                {0.92f * r, h, 0.38f * r},   // thin bar whose ends reach the rim (0.92^2 + 0.38^2 ~ 1)
+                                {body.ax[0] * cs + body.ax[2] * sn, body.ax[1], body.ax[2] * cs - body.ax[0] * sn},
+                                false};
+        }
+    } else {
+        p.box[p.count++] = ToBox(body);
+    }
+    return p;
 }
 
 // Extent of the body along each world axis (what its AABB would be).
 Vec3 WorldExtent(const Body& b) {
+    const Parts parts = MakeParts(b);
     Vec3 e;
-    if (b.shape == Shape::Cone) {
-        ConeSpheres cs = MakeConeSpheres(b);
-        for (int i = 0; i < 3; ++i) {
-            float m = 0;
-            for (int k = 0; k < 3; ++k) m = std::max(m, std::fabs(Comp(b.ax[1], i) * cs.c[k]) + cs.s[k]);
-            SetComp(e, i, m);
+    for (int i = 0; i < 3; ++i) {
+        float m = 0;
+        for (int k = 0; k < parts.count; ++k) {
+            const Box& p = parts.box[k];
+            float ext = std::fabs(Comp(p.pos - b.pos, i));
+            for (int j = 0; j < 3; ++j) ext += Comp(p.half, j) * std::fabs(Comp(p.ax[j], i));
+            m = std::max(m, ext);
         }
-        return e;
+        SetComp(e, i, m);
     }
-    for (int i = 0; i < 3; ++i)
-        SetComp(e, i, b.half.x * std::fabs(Comp(b.ax[0], i)) + b.half.y * std::fabs(Comp(b.ax[1], i)) +
-                          b.half.z * std::fabs(Comp(b.ax[2], i)));
     return e;
 }
 
 // Farthest point of the box in direction dir.
-Vec3 Support(const Body& b, Vec3 dir) {
+Vec3 Support(const Box& b, Vec3 dir) {
     auto s = [](float v) { return v >= 0 ? 1.0f : -1.0f; };
     return b.pos + b.ax[0] * (s(Dot(b.ax[0], dir)) * b.half.x) + b.ax[1] * (s(Dot(b.ax[1], dir)) * b.half.y) +
            b.ax[2] * (s(Dot(b.ax[2], dir)) * b.half.z);
@@ -76,7 +111,7 @@ struct Contact {
 // OBB vs OBB: separating axis theorem over the 3 + 3 face axes and the 9 edge-edge axes.
 // The axis with the smallest overlap is the contact normal; the contact point is midway between the two
 // deepest corners.
-bool ObbObb(const Body& a, const Body& b, Contact& c) {
+bool ObbObb(const Box& a, const Box& b, Contact& c) {
     const Vec3 d = b.pos - a.pos;
     float best = 1e30f;
     bool separated = false;
@@ -110,8 +145,19 @@ bool ObbObb(const Body& a, const Body& b, Contact& c) {
     return true;
 }
 
+bool SpherePair(const Box& a, const Box& b, Contact& c) {
+    const Vec3 d = b.pos - a.pos;
+    const float r = a.half.x + b.half.x, d2 = Dot(d, d);
+    if (d2 >= r * r) return false;
+    const float dist = std::sqrt(d2);
+    c.n = dist > 1e-6f ? d * (1.0f / dist) : Vec3(0, 1, 0);
+    c.depth = r - dist;
+    c.p = a.pos + c.n * (a.half.x - c.depth * 0.5f);
+    return true;
+}
+
 // a = sphere, b = oriented box. Closest point on the box to the sphere centre, found in the box's own axes.
-bool SphereObb(const Body& a, const Body& b, Contact& c) {
+bool SphereObb(const Box& a, const Box& b, Contact& c) {
     const float r = a.half.x;
     Vec3 rel = a.pos - b.pos;
     Vec3 closest = b.pos;
@@ -141,37 +187,13 @@ bool SphereObb(const Body& a, const Body& b, Contact& c) {
     return true;
 }
 
-bool Narrow(const Body& a, const Body& b, Contact& c) {
-    bool sa = a.shape == Shape::Sphere, sb = b.shape == Shape::Sphere;
-    if (sa && sb) {
-        float depth;
-        if (!SphereSphere(a, b, c.n, depth)) return false;
-        c.depth = depth;
-        c.p = a.pos + c.n * (a.half.x - depth * 0.5f);
-        return true;
-    }
-    if (!sa && !sb) return ObbObb(a, b, c);
-    if (sa) return SphereObb(a, b, c);
+bool Narrow(const Box& a, const Box& b, Contact& c) {
+    if (a.sphere && b.sphere) return SpherePair(a, b, c);
+    if (!a.sphere && !b.sphere) return ObbObb(a, b, c);
+    if (a.sphere) return SphereObb(a, b, c);
     if (!SphereObb(b, a, c)) return false;
     c.n = -c.n;
     return true;
-}
-
-// The collision parts of a body: a cone gives its three spheres (written into tmp), anything else is a
-// single part, the body itself. Returns the number of parts.
-int Parts(const Body& body, Body tmp[3], const Body* out[3]) {
-    if (body.shape != Shape::Cone) {
-        out[0] = &body;
-        return 1;
-    }
-    ConeSpheres cs = MakeConeSpheres(body);
-    for (int k = 0; k < 3; ++k) {
-        tmp[k].shape = Shape::Sphere;
-        tmp[k].pos = body.pos + body.ax[1] * cs.c[k];
-        tmp[k].half = {cs.s[k], cs.s[k], cs.s[k]};
-        out[k] = &tmp[k];
-    }
-    return 3;
 }
 
 // Impulse at the contact point p: linear response plus torque (r x J), with Coulomb friction.
@@ -210,7 +232,7 @@ void ObbWorld::InitBody(Body& b) { b.w = {Rand(-3, 3), Rand(-3, 3), Rand(-3, 3)}
 
 void ObbWorld::OnKick(Body& b) { b.w += Vec3(Rand(-8, 8), Rand(-8, 8), Rand(-8, 8)); }
 
-void ObbWorld::OnAdopt(Body& b) { b.w = {Rand(-3, 3), Rand(-3, 3), Rand(-3, 3)}; }   // visible spin right away
+void ObbWorld::OnAdopt(Body& b) { InitBody(b); }   // visible spin right away
 
 void ObbWorld::UpdateBody(Body& b, float h) {
     b.w = b.w * std::max(0.0f, 1.0f - kAngularDamping * h);
@@ -225,15 +247,17 @@ void ObbWorld::Resolve(Body& a, Body& b) {
     if (Dot(d, d) >= r * r) return;
 
     // test every part of a against every part of b and keep the deepest contact
-    Body tmpA[3], tmpB[3];
-    const Body *partsA[3], *partsB[3];
-    int na = Parts(a, tmpA, partsA), nb = Parts(b, tmpB, partsB);
+    const Parts pa = MakeParts(a), pb = MakeParts(b);
     Contact c;
     bool hit = false;
-    for (int i = 0; i < na; ++i)
-        for (int j = 0; j < nb; ++j) {
+    for (int i = 0; i < pa.count; ++i)
+        for (int j = 0; j < pb.count; ++j) {
+            // cheap per-part reject (many voxels per cone): bounding spheres must overlap
+            Vec3 pd = pb.box[j].pos - pa.box[i].pos;
+            float pr = Length(pa.box[i].half) + Length(pb.box[j].half);
+            if (Dot(pd, pd) >= pr * pr) continue;
             Contact t;
-            if (Narrow(*partsA[i], *partsB[j], t) && (!hit || t.depth > c.depth)) {
+            if (Narrow(pa.box[i], pb.box[j], t) && (!hit || t.depth > c.depth)) {
                 c = t;
                 hit = true;
             }

@@ -1,7 +1,0 @@
-{
-  "name": "physicssim",
-  "version": "0.1.0",
-  "dependencies": [
-    { "name": "assimp", "default-features": false }
-  ]
-}

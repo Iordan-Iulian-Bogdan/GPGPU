@@ -43,7 +43,7 @@ public:
     void SetParallel(bool on) { parallel_ = on; }
     bool Parallel() const { return parallel_; }
 
-    virtual bool Obb() const = 0;         // which collision model this world uses
+    virtual bool Obb() const = 0;         // does this world rotate its bodies (OBB-style)?
 
     // Takes over the bodies and settings of another world (used when switching collision model at runtime).
     void AdoptState(const World& other);
