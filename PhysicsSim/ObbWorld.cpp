@@ -34,11 +34,10 @@ struct Box {
 Box ToBox(const Body& b) { return {b.pos, b.half, {b.ax[0], b.ax[1], b.ax[2]}, b.shape == Shape::Sphere}; }
 
 // Cones and cylinders are approximated by boxes that sit inside the shape, aligned with its axis (local y):
-//  - cone: a voxel grid. kConeLayers layers along the axis, each a kConeGrid x kConeGrid grid of cubes; a cube is
-//    kept when its centre lies within the cone's radius at that layer's mid height
-//  - cylinder: thin bars fanned evenly about the axis (a star-shaped footprint that fills the circle)
-constexpr int kConeLayers = 4, kConeGrid = 4, kCylinderBars = 8;
-constexpr int kMaxParts = std::max(kConeLayers * kConeGrid * kConeGrid, kCylinderBars);
+//  - cylinder: kCylinderBars thin bars fanned evenly about the axis (a regular polygon footprint)
+//  - cone: kConeLayers short cylinders stacked along the axis, each as wide as the cone at its mid height
+constexpr int kConeLayers = 8, kCylinderBars = 8;
+constexpr int kMaxParts = kConeLayers * kCylinderBars;
 
 // The collision primitives of one body. Anything that is not a cone or cylinder is a single part.
 struct Parts {
@@ -46,32 +45,33 @@ struct Parts {
     int count = 0;
 };
 
+// Adds a cylinder (radius r, half height hh, centred yc along the body's axis) as kCylinderBars bars.
+// These are the thinnest bars that still cover the whole disk: a point between two neighbouring bars is at most
+// pi / (2N) away from the nearest bar's axis, so the half width is r * sin(pi / 2N). The half length puts the bar
+// corners exactly on the rim, which makes the footprint a regular 2N-gon.
+void AddCylinder(Parts& p, const Body& body, float yc, float r, float hh) {
+    const float w = r * std::sin(kPi / (2 * kCylinderBars)), a = std::sqrt(r * r - w * w);
+    const Vec3 centre = body.pos + body.ax[1] * yc;
+    for (int k = 0; k < kCylinderBars; ++k) {
+        const float ang = kPi * k / kCylinderBars, cs = std::cos(ang), sn = std::sin(ang);   // fanned over 180 degrees
+        p.box[p.count++] = {centre,
+                            {a, hh, w},
+                            {body.ax[0] * cs + body.ax[2] * sn, body.ax[1], body.ax[2] * cs - body.ax[0] * sn},
+                            false};
+    }
+}
+
 Parts MakeParts(const Body& body) {
     Parts p;
     const float r = body.half.x, h = body.half.y;
-    if (body.shape == Shape::Cone) {
-        const float cell = r / kConeGrid, layerH = h / kConeLayers;   // half sizes of one voxel
+    if (body.shape == Shape::Cone) {   // base at local y = -h, apex at y = +h
+        const float layerH = h / kConeLayers;   // half height of one layer
         for (int ly = 0; ly < kConeLayers; ++ly) {
             const float yc = -h + layerH * (2 * ly + 1);
-            const float rad = r * (h - yc) / (2 * h);   // cone radius at the layer's mid height
-            for (int i = 0; i < kConeGrid; ++i)
-                for (int j = 0; j < kConeGrid; ++j) {
-                    const float x = (2 * i + 1 - kConeGrid) * cell, z = (2 * j + 1 - kConeGrid) * cell;
-                    if (x * x + z * z > rad * rad) continue;
-                    p.box[p.count++] = {body.pos + body.ax[0] * x + body.ax[1] * yc + body.ax[2] * z,
-                                        {cell, layerH, cell},
-                                        {body.ax[0], body.ax[1], body.ax[2]},
-                                        false};
-                }
+            AddCylinder(p, body, yc, r * (h - yc) / (2 * h), layerH);   // cone radius at the layer's mid height
         }
     } else if (body.shape == Shape::Cylinder) {
-        for (int k = 0; k < kCylinderBars; ++k) {
-            const float ang = kPi * k / kCylinderBars, cs = std::cos(ang), sn = std::sin(ang);   // fanned over 180 degrees
-            p.box[p.count++] = {body.pos,
-                                {0.92f * r, h, 0.38f * r},   // thin bar whose ends reach the rim (0.92^2 + 0.38^2 ~ 1)
-                                {body.ax[0] * cs + body.ax[2] * sn, body.ax[1], body.ax[2] * cs - body.ax[0] * sn},
-                                false};
-        }
+        AddCylinder(p, body, 0.0f, r, h);
     } else {
         p.box[p.count++] = ToBox(body);
     }
@@ -248,8 +248,13 @@ void ObbWorld::Resolve(Body& a, Body& b) {
 
     // test every part of a against every part of b and keep the deepest contact
     const Parts pa = MakeParts(a), pb = MakeParts(b);
-    Contact c;
-    bool hit = false;
+    // Every overlapping part pair contributes: the normal is the depth-weighted average (a single thin part pair
+    // would otherwise cap the depth at the part's thickness and leave deep overlaps unresolved), the point is the
+    // depth-weighted average contact point, and the depth is the largest overlap of any pair measured along that normal.
+    Contact hits[kMaxParts * 4];
+    int nHits = 0;
+    Vec3 nSum(0, 0, 0), pSum(0, 0, 0);
+    float wSum = 0;
     for (int i = 0; i < pa.count; ++i)
         for (int j = 0; j < pb.count; ++j) {
             // cheap per-part reject (many voxels per cone): bounding spheres must overlap
@@ -257,12 +262,18 @@ void ObbWorld::Resolve(Body& a, Body& b) {
             float pr = Length(pa.box[i].half) + Length(pb.box[j].half);
             if (Dot(pd, pd) >= pr * pr) continue;
             Contact t;
-            if (Narrow(pa.box[i], pb.box[j], t) && (!hit || t.depth > c.depth)) {
-                c = t;
-                hit = true;
-            }
+            if (!Narrow(pa.box[i], pb.box[j], t)) continue;
+            nSum += t.n * t.depth;
+            pSum += t.p * t.depth;
+            wSum += t.depth;
+            if (nHits < kMaxParts * 4) hits[nHits++] = t;
         }
-    if (!hit) return;
+    if (nHits == 0) return;
+    Contact c;
+    const float nl = Length(nSum);
+    c.n = nl > 1e-6f ? nSum * (1.0f / nl) : hits[0].n;
+    c.p = pSum * (1.0f / wSum);
+    for (int k = 0; k < nHits; ++k) c.depth = std::max(c.depth, hits[k].depth * std::max(0.0f, Dot(hits[k].n, c.n)));
     SeparateBodies(a, b, c.n, c.depth);
     ContactImpulse(a, b, c.n, c.p);
 }
