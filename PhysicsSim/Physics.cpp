@@ -7,7 +7,7 @@ using namespace phys;
 
 World::World() : rng_(12345) {
     bodies_.reserve(MaxBodies);
-    head_.resize(kCells);
+    head_.resize(kMaxCells);
 }
 
 void World::Clear() {
@@ -119,12 +119,14 @@ void World::SubStep(float h) {
         UpdateBody(b, h);
     }
 
-    // broad phase: uniform grid (linked lists)
+    // broad phase: uniform grid (linked lists), sized for the collision model
+    const Grid g = GridFor(Obb());
+    const int NX = g.nx, NY = g.ny, NZ = g.nz;
     std::fill(head_.begin(), head_.end(), -1);
     next_.assign(bodies_.size(), -1);
     for (int i = 0; i < (int)bodies_.size(); ++i) {
         int cx, cy, cz;
-        CellCoords(bodies_[i].pos, cx, cy, cz);
+        CellCoords(g, bodies_[i].pos, cx, cy, cz);
         int c = (cz * NY + cy) * NX + cx;
         next_[i] = head_[c];
         head_[c] = i;

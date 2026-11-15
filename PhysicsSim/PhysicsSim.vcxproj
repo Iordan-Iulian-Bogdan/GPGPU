@@ -96,6 +96,7 @@
     <ClInclude Include="math3d.h" />
     <ClInclude Include="mesh.h" />
     <ClInclude Include="ObbCollision.h" />
+    <ClInclude Include="ObbWave.h" />
     <ClInclude Include="ObbWorld.h" />
     <ClInclude Include="Physics.h" />
     <ClInclude Include="PhysicsCommon.h" />

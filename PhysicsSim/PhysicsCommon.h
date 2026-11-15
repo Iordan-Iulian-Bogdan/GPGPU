@@ -14,13 +14,26 @@ inline constexpr float kCorrection = 0.8f;
 inline constexpr float kPi = 3.14159265f;
 inline constexpr int kSubSteps = 2;
 
-// Uniform grid of the broad phase. Cell size must be >= the largest centre distance at which two bodies can
-// touch: two bounding spheres of radius 0.61 (a rotated cube's half-diagonal) = 1.22.
-inline constexpr float kCell = 1.25f;
-inline constexpr int NX = (int)(2 * kBoxW / kCell) + 1;
-inline constexpr int NY = (int)(kBoxH / kCell) + 1;
-inline constexpr int NZ = (int)(2 * kBoxD / kCell) + 1;
-inline constexpr int kCells = NX * NY * NZ;
+// Uniform grid of the broad phase. A body only has to be tested against the bodies in the 3x3x3 cells around its
+// own, which is enough if a cell is at least as wide as the largest distance (on one axis) at which two bodies can
+// still touch. That depends on the collision model, so each model has its own grid:
+//  - AABB: two boxes touch when their centres are closer than the sum of the half extents on every axis, and no
+//          half extent is larger than 0.4 (sphere radius), so 0.8 on one axis.
+//  - OBB:  two bounding spheres of radius 0.61 (a rotated cube's half-diagonal) = 1.22.
+// Smaller cells hold fewer bodies, so the AABB grid has far fewer pair candidates.
+struct Grid {
+    float cell;
+    int nx, ny, nz;
+    PHYS_HD constexpr int cells() const { return nx * ny * nz; }
+};
+PHYS_HD constexpr Grid MakeGrid(float cell) {
+    return {cell, (int)(2 * kBoxW / cell) + 1, (int)(kBoxH / cell) + 1, (int)(2 * kBoxD / cell) + 1};
+}
+PHYS_HD constexpr Grid GridAabb() { return MakeGrid(0.85f); }
+PHYS_HD constexpr Grid GridObb() { return MakeGrid(1.25f); }
+PHYS_HD constexpr Grid GridFor(bool obb) { return obb ? GridObb() : GridAabb(); }
+// Room for the cell arrays of either grid.
+inline constexpr int kMaxCells = GridAabb().cells() > GridObb().cells() ? GridAabb().cells() : GridObb().cells();
 
 PHYS_HD inline float Clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 PHYS_HD inline int Clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -28,10 +41,10 @@ PHYS_HD inline float Comp(const Vec3& v, int i) { return i == 0 ? v.x : (i == 1 
 PHYS_HD inline void SetComp(Vec3& v, int i, float f) { (i == 0 ? v.x : (i == 1 ? v.y : v.z)) = f; }
 
 // Grid cell of a position.
-PHYS_HD inline void CellCoords(const Vec3& p, int& cx, int& cy, int& cz) {
-    cx = Clampi((int)((p.x + kBoxW) / kCell), 0, NX - 1);
-    cy = Clampi((int)(p.y / kCell), 0, NY - 1);
-    cz = Clampi((int)((p.z + kBoxD) / kCell), 0, NZ - 1);
+PHYS_HD inline void CellCoords(const Grid& g, const Vec3& p, int& cx, int& cy, int& cz) {
+    cx = Clampi((int)((p.x + kBoxW) / g.cell), 0, g.nx - 1);
+    cy = Clampi((int)(p.y / g.cell), 0, g.ny - 1);
+    cz = Clampi((int)((p.z + kBoxD) / g.cell), 0, g.nz - 1);
 }
 
 // Contact between a and b. n points from a to b.
