@@ -76,6 +76,7 @@
   <ItemGroup>
     <ClCompile Include="AabbWorld.cpp" />
     <ClCompile Include="camera.cpp" />
+    <ClCompile Include="HipWorld.cpp" />
     <ClCompile Include="importer.cpp" />
     <ClCompile Include="input.cpp" />
     <ClCompile Include="main.cpp" />
@@ -85,19 +86,25 @@
     <ClCompile Include="renderer.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AabbCollision.h" />
     <ClInclude Include="AabbWorld.h" />
     <ClInclude Include="camera.h" />
+    <ClInclude Include="HipWorld.h" />
     <ClInclude Include="importer.h" />
     <ClInclude Include="input.h" />
     <ClInclude Include="instance.h" />
     <ClInclude Include="math3d.h" />
     <ClInclude Include="mesh.h" />
+    <ClInclude Include="ObbCollision.h" />
     <ClInclude Include="ObbWorld.h" />
     <ClInclude Include="Physics.h" />
     <ClInclude Include="PhysicsCommon.h" />
+    <ClInclude Include="PhysicsTypes.h" />
     <ClInclude Include="renderer.h" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="hip\build_hip.bat" />
+    <None Include="hip\PhysicsHip.hip" />
     <None Include="assets\cone.obj" />
     <None Include="assets\cube.obj" />
     <None Include="assets\cylinder.obj" />
@@ -109,6 +116,18 @@
       <AssetFiles Include="$(MSBuildProjectDirectory)\assets\**\*" />
     </ItemGroup>
     <Copy SourceFiles="@(AssetFiles)" DestinationFolder="$(OutDir)assets" SkipUnchangedFiles="true" />
+  </Target>
+  <!-- AMD HIP (GPU) backend: PhysicsHip.dll is built from hip\PhysicsHip.hip when the AMD HIP SDK is installed. It is
+       optional: without the SDK the app is built without it and simply has no GPU backend. -->
+  <Target Name="BuildHipBackend" AfterTargets="Build"
+          Inputs="hip\PhysicsHip.hip;hip\build_hip.bat;PhysicsTypes.h;PhysicsCommon.h;AabbCollision.h;ObbCollision.h;ObbWave.h;math3d.h"
+          Outputs="$(OutDir)PhysicsHip.dll">
+    <Exec Command="call &quot;$(MSBuildProjectDirectory)\hip\build_hip.bat&quot; &quot;$(OutDir)&quot; &quot;&quot; &quot;$(VsInstallRoot)&quot;"
+          IgnoreExitCode="true" ContinueOnError="true">
+      <Output TaskParameter="ExitCode" PropertyName="HipExitCode" />
+    </Exec>
+    <Message Importance="high" Condition="'$(HipExitCode)'=='2'" Text="AMD HIP SDK not found: built without the GPU backend." />
+    <Warning Condition="'$(HipExitCode)'=='1'" Text="Building PhysicsHip.dll failed: the app will run without the GPU backend." />
   </Target>
   <Target Name="CopyAssimpDlls" AfterTargets="Build">
     <ItemGroup>

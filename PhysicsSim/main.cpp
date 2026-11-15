@@ -1,5 +1,6 @@
 // Etapa 1 - Prototip 1: 3D Virtual World Physics (CPU), rendered with the MG3D Direct3D 12 renderer.
 #include "AabbWorld.h"
+#include "HipWorld.h"
 #include "ObbWorld.h"
 #include "Physics.h"
 #include "camera.h"
@@ -109,6 +110,29 @@ std::filesystem::path AssetsFolder()
 }
 }  // namespace
 
+// Replaces `world` by one with the requested backend and collision model, keeping the bodies. If the GPU is
+// requested but unavailable, the CPU world is used instead and the reason is printed.
+void SwitchWorld(std::unique_ptr<World>& world, bool gpu, bool obb)
+{
+    std::unique_ptr<World> next;
+    if (gpu)
+    {
+        std::string info;
+        next = MakeHipWorld(obb, info);
+        if (next)
+            std::printf("GPU backend: %s\n", info.c_str());
+        else
+            std::printf("GPU backend not available: %s\n", info.c_str());
+    }
+    if (!next)
+    {
+        if (obb) next = std::make_unique<ObbWorld>();
+        else next = std::make_unique<AabbWorld>();
+    }
+    next->AdoptState(*world);
+    world = std::move(next);
+}
+
 int main()
 {
     std::printf(
@@ -118,7 +142,8 @@ int main()
         "  C         clear the box\n"
         "  F1/F2/F3  predefined modes: 100/250/500, 250/500/1000, 500/1000/2500 (sphere/cube/cyl+cone)\n"
         "  O         toggle collision mode: AABB (no rotation) / OBB (oriented boxes, bodies rotate)\n"
-        "  T         toggle OpenMP on/off (collision pass)\n"
+        "  G         toggle backend: CPU / GPU (AMD HIP, needs PhysicsHip.dll and an AMD GPU)\n"
+        "  T         toggle OpenMP on/off (CPU backend)\n"
         "  V         toggle VSync on/off\n"
         "  P         pause   |  Esc: quit\n");
 
@@ -163,7 +188,8 @@ int main()
 
     ShowWindow(hwnd, SW_SHOW);
 
-    // The collision model is a subclass of World; "O" swaps it at runtime and carries the bodies over.
+    // The collision model (AABB/OBB) and the backend (CPU/GPU) are chosen by the World subclass; "O" and "G" swap
+    // it at runtime and carry the bodies over.
     std::unique_ptr<World> world = std::make_unique<AabbWorld>();
     world->LoadPreset(0);
     std::vector<Instance> instances[4];
@@ -204,14 +230,8 @@ int main()
         if (input.WasPressed('C')) world->Clear();
         if (input.WasPressed('P')) paused = !paused;
         if (input.WasPressed('T')) world->SetParallel(!world->Parallel());
-        if (input.WasPressed('O'))
-        {
-            std::unique_ptr<World> next;
-            if (world->Obb()) next = std::make_unique<AabbWorld>();
-            else next = std::make_unique<ObbWorld>();
-            next->AdoptState(*world);
-            world = std::move(next);
-        }
+        if (input.WasPressed('O')) SwitchWorld(world, world->Gpu(), !world->Obb());
+        if (input.WasPressed('G')) SwitchWorld(world, !world->Gpu(), world->Obb());
         if (input.WasPressed('V')) renderer.SetVsync(!renderer.Vsync());
         for (UINT key = VK_F1; key <= VK_F3; key++)
             if (input.WasPressed(key)) world->LoadPreset(key - VK_F1);
@@ -242,9 +262,13 @@ int main()
         fpsFrames++;
         if (fpsTimer >= 0.5f)
         {
-            wchar_t title[256];
-            swprintf_s(title, L"Etapa 1 - CPU Physics (%s, OpenMP %s, VSync %s) | objects: %zu | FPS: %.1f | physics: %.2f ms/frame%s",
-                       world->Obb() ? L"OBB" : L"AABB", world->Parallel() ? L"ON" : L"OFF", renderer.Vsync() ? L"ON" : L"OFF", world->Bodies().size(),
+            wchar_t title[320], backend[96];
+            if (world->Gpu())
+                swprintf_s(backend, L"GPU/HIP, kernel %.2f ms", world->GpuMs());
+            else
+                swprintf_s(backend, L"CPU, OpenMP %s", world->Parallel() ? L"ON" : L"OFF");
+            swprintf_s(title, L"Etapa 1 - Physics (%s, %s, VSync %s) | objects: %zu | FPS: %.1f | physics: %.2f ms/frame%s",
+                       world->Obb() ? L"OBB" : L"AABB", backend, renderer.Vsync() ? L"ON" : L"OFF", world->Bodies().size(),
                        fpsFrames / fpsTimer, physicsMs / fpsFrames, paused ? L" | PAUSED" : L"");
             SetWindowTextW(hwnd, title);
             fpsTimer = 0;

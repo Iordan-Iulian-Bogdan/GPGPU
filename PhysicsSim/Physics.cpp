@@ -5,28 +5,22 @@
 
 using namespace phys;
 
-namespace {
-// Cell size must be >= the largest centre distance at which two bodies can touch: two bounding spheres of
-// radius 0.61 (a rotated cube's half-diagonal) = 1.22.
-constexpr float kCell = 1.25f;
-constexpr int kSubSteps = 2;
-constexpr int NX = (int)(2 * World::W / kCell) + 1;
-constexpr int NY = (int)(World::H / kCell) + 1;
-constexpr int NZ = (int)(2 * World::D / kCell) + 1;
-}  // namespace
-
 World::World() : rng_(12345) {
     bodies_.reserve(MaxBodies);
-    head_.resize((size_t)NX * NY * NZ);
+    head_.resize(kCells);
 }
 
-void World::Clear() { bodies_.clear(); }
+void World::Clear() {
+    bodies_.clear();
+    bodiesChanged_ = true;
+}
 
 void World::AdoptState(const World& other) {
     bodies_ = other.bodies_;
     rng_ = other.rng_;
     parallel_ = other.parallel_;
     for (Body& b : bodies_) OnAdopt(b);
+    bodiesChanged_ = true;
 }
 
 void World::AddBody(Shape s, Vec3 pos, Vec3 vel) {
@@ -75,6 +69,7 @@ void World::AddBody(Shape s, Vec3 pos, Vec3 vel) {
     b.color = {Rand(0.25f, 1.0f), Rand(0.25f, 1.0f), Rand(0.25f, 1.0f)};
     InitBody(b);
     bodies_.push_back(b);
+    bodiesChanged_ = true;
 }
 
 void World::Spawn(Shape s, bool atTop) {
@@ -113,14 +108,7 @@ void World::Kick() {
         b.vel += Vec3(Rand(-6, 6), Rand(3, 10), Rand(-6, 6));
         OnKick(b);
     }
-}
-
-void World::SeparateBodies(Body& a, Body& b, Vec3 n, float depth) {
-    float sum = a.invMass + b.invMass;
-    float corr = std::max(depth - kSlop, 0.0f) * kCorrection / sum;
-    corr = std::min(corr, 0.5f);
-    a.pos -= n * (corr * a.invMass);
-    b.pos += n * (corr * b.invMass);
+    bodiesChanged_ = true;
 }
 
 void World::SubStep(float h) {
@@ -134,14 +122,9 @@ void World::SubStep(float h) {
     // broad phase: uniform grid (linked lists)
     std::fill(head_.begin(), head_.end(), -1);
     next_.assign(bodies_.size(), -1);
-    auto cellOf = [](const Vec3& p, int& cx, int& cy, int& cz) {
-        cx = Clampi((int)((p.x + World::W) / kCell), 0, NX - 1);
-        cy = Clampi((int)(p.y / kCell), 0, NY - 1);
-        cz = Clampi((int)((p.z + World::D) / kCell), 0, NZ - 1);
-    };
     for (int i = 0; i < (int)bodies_.size(); ++i) {
         int cx, cy, cz;
-        cellOf(bodies_[i].pos, cx, cy, cz);
+        CellCoords(bodies_[i].pos, cx, cy, cz);
         int c = (cz * NY + cy) * NX + cx;
         next_[i] = head_[c];
         head_[c] = i;

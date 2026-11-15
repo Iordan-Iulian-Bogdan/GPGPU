@@ -2,6 +2,13 @@
 
 #include <cmath>
 
+// Functions marked PHYS_HD can run on the CPU and, when compiled by hipcc (clang HIP), on the GPU.
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define PHYS_HD __host__ __device__
+#else
+#define PHYS_HD
+#endif
+
 // Conventions: left-handed, Y up, row vectors (v * M), matrices stored row-major.
 // This matches Direct3D, so matrices can be sent to HLSL as row_major float4x4.
 
@@ -19,26 +26,26 @@ struct Vec3
     float x = 0, y = 0, z = 0;
 };
 
-inline Vec3 operator+(Vec3 a, Vec3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-inline Vec3 operator-(Vec3 a, Vec3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-inline Vec3 operator*(Vec3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-inline Vec3 operator-(Vec3 a) { return { -a.x, -a.y, -a.z }; }
-inline Vec3& operator+=(Vec3& a, Vec3 b) { a = a + b; return a; }
-inline Vec3& operator-=(Vec3& a, Vec3 b) { a = a - b; return a; }
+PHYS_HD inline Vec3 operator+(Vec3 a, Vec3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+PHYS_HD inline Vec3 operator-(Vec3 a, Vec3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+PHYS_HD inline Vec3 operator*(Vec3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
+PHYS_HD inline Vec3 operator-(Vec3 a) { return { -a.x, -a.y, -a.z }; }
+PHYS_HD inline Vec3& operator+=(Vec3& a, Vec3 b) { a = a + b; return a; }
+PHYS_HD inline Vec3& operator-=(Vec3& a, Vec3 b) { a = a - b; return a; }
 
-inline float Dot(Vec3 a, Vec3 b) 
+PHYS_HD inline float Dot(Vec3 a, Vec3 b) 
 { 
     return a.x * b.x + a.y * b.y + a.z * b.z; 
 }
 
-inline Vec3 Cross(Vec3 a, Vec3 b)
+PHYS_HD inline Vec3 Cross(Vec3 a, Vec3 b)
 {
     return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
 }
 
-inline float Length(Vec3 v) { return std::sqrt(Dot(v, v)); }
+PHYS_HD inline float Length(Vec3 v) { return std::sqrt(Dot(v, v)); }
 
-inline Vec3 Normalize(Vec3 v)
+PHYS_HD inline Vec3 Normalize(Vec3 v)
 {
     float len = Length(v);
     return len > 0 ? v * (1.0f / len) : Vec3{};
