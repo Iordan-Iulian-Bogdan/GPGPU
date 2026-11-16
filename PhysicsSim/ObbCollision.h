@@ -122,9 +122,11 @@ PHYS_HD inline Vec3 WorldExtent(const Body& b) {
     return e;
 }
 
-// Farthest point of the box in direction dir.
+// Farthest point of the box in direction dir. When dir is (nearly) perpendicular to an axis the whole edge / face
+// is equally far, and its middle is returned: picking a corner by the sign of a value that is zero up to rounding
+// would make the contact point of a box resting on a face jump between corners from step to step.
 PHYS_HD inline Vec3 Support(const Box& b, Vec3 dir) {
-    auto s = [](float v) { return v >= 0 ? 1.0f : -1.0f; };
+    auto s = [](float v) { return v > 0.02f ? 1.0f : (v < -0.02f ? -1.0f : 0.0f); };
     return b.pos + b.ax[0] * (s(Dot(b.ax[0], dir)) * b.half.x) + b.ax[1] * (s(Dot(b.ax[1], dir)) * b.half.y) +
            b.ax[2] * (s(Dot(b.ax[2], dir)) * b.half.z);
 }

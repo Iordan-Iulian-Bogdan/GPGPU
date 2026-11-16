@@ -55,7 +55,7 @@ protected:
 
 private:
     void AddBody(Shape s, Vec3 pos, Vec3 vel);
-    void SubStep(float h);
+    void SubStep(float h, bool reverse);
 
     // uniform grid for the broad phase
     std::vector<int> head_, next_;

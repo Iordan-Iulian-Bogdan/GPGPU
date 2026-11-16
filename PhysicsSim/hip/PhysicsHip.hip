@@ -255,9 +255,10 @@ __global__ __launch_bounds__(obb::kWave) void NarrowKernel(const Body* bodies, i
 // ---- substep part 3: the solver for the cells of one colour, one thread per cell ----
 // Walks the pairs owned by the bodies of the cell in a fixed order and applies positional correction and impulses.
 // The partners are in the 27 cells around, which no other cell of this colour touches.
-__global__ void SolveKernel(Body* bodies, int obbMode, Grid g, int color, const int* cellCount, const int* cellStart,
-                            const int* sorted, const int* pairCount, const int* pairBody,
-                            const PairContact* contacts) {
+// `reverse` walks the bodies and their pairs backwards (see LaunchSolve).
+__global__ void SolveKernel(Body* bodies, int obbMode, Grid g, int color, int reverse, const int* cellCount,
+                            const int* cellStart,
+                            const int* sorted, const int* pairCount, const int* pairBody, const PairContact* contacts) {
     const int ox = color % 3, oy = (color / 3) % 3, oz = color / 9;
     const int cxn = (g.nx - ox + 2) / 3, cyn = (g.ny - oy + 2) / 3, czn = (g.nz - oz + 2) / 3;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -268,12 +269,13 @@ __global__ void SolveKernel(Body* bodies, int obbMode, Grid g, int color, const 
     const int own = (cz * g.ny + cy) * g.nx + cx;
 
     const int first = cellStart[own], cnt = cellCount[own];
-    for (int ia = 0; ia < cnt; ++ia) {
-        const int i = sorted[first + ia];
+    for (int ib = 0; ib < cnt; ++ib) {
+        const int i = sorted[first + (reverse ? cnt - 1 - ib : ib)];
         const int pairs = pairCount[i];
         if (pairs == 0) continue;
         Body a = bodies[i];
-        for (int k = 0; k < pairs; ++k) {
+        for (int kb = 0; kb < pairs; ++kb) {
+            const int k = reverse ? pairs - 1 - kb : kb;
             const int j = pairBody[i * kMaxPairs + k];
             if (obbMode) {
                 const PairContact c = contacts[i * kMaxPairs + k];
@@ -309,20 +311,23 @@ void LaunchNarrow(Sim* s, int obbMode) {
                                            s->sorted, s->cellOfBody, s->pairCount, s->pairBody, s->contacts);
 }
 
-void LaunchSolve(Sim* s, int obbMode) {
+// Every other substep sweeps backwards (colours, bodies, pairs): always going the same way pushes the bodies a
+// little in one direction on average.
+void LaunchSolve(Sim* s, int obbMode, int reverse) {
     const Grid g = GridFor(obbMode != 0);
-    for (int color = 0; color < kColors; ++color) {
+    for (int pass = 0; pass < kColors; ++pass) {
+        const int color = reverse ? kColors - 1 - pass : pass;
         const int ox = color % 3, oy = color / 3 % 3, oz = color / 9;
         const int cells = ((g.nx - ox + 2) / 3) * ((g.ny - oy + 2) / 3) * ((g.nz - oz + 2) / 3);
-        SolveKernel<<<(cells + 63) / 64, 64>>>(s->bodies, obbMode, g, color, s->cellCount, s->cellStart, s->sorted,
+        SolveKernel<<<(cells + 63) / 64, 64>>>(s->bodies, obbMode, g, color, reverse, s->cellCount, s->cellStart, s->sorted,
                                                s->pairCount, s->pairBody, s->contacts);
     }
 }
 
-void LaunchSubStep(Sim* s, float h, int obbMode) {
+void LaunchSubStep(Sim* s, float h, int obbMode, int reverse) {
     LaunchGrid(s, h, obbMode);
     LaunchNarrow(s, obbMode);
-    LaunchSolve(s, obbMode);
+    LaunchSolve(s, obbMode, reverse);
 }
 
 void FreeAll(Sim* s) {
@@ -396,7 +401,7 @@ PH_EXPORT int ph_step(void* handle, float h, int substeps, int obbMode, float* g
     if (s->count == 0) return 1;
     if (!Check(hipEventRecord(s->start), "hipEventRecord")) return 0;
     for (int step = 0; step < substeps; ++step) {
-        LaunchSubStep(s, h, obbMode);
+        LaunchSubStep(s, h, obbMode, step & 1);
     }
     if (!Check(hipGetLastError(), "kernel launch") || !Check(hipEventRecord(s->stop), "hipEventRecord") ||
         !Check(hipEventSynchronize(s->stop), "kernel execution"))
@@ -422,7 +427,7 @@ PH_EXPORT int ph_profile(void* handle, float h, int substeps, int obbMode, float
         (void)hipEventRecord(ev[3 * step + 1]);
         LaunchNarrow(s, obbMode);
         (void)hipEventRecord(ev[3 * step + 2]);
-        LaunchSolve(s, obbMode);
+        LaunchSolve(s, obbMode, step & 1);
         (void)hipEventRecord(ev[3 * step + 3]);
     }
     bool ok = Check(hipEventSynchronize(ev[3 * substeps]), "profile");

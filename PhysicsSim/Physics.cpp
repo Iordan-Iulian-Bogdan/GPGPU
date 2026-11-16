@@ -111,7 +111,7 @@ void World::Kick() {
     bodiesChanged_ = true;
 }
 
-void World::SubStep(float h) {
+void World::SubStep(float h, bool reverse) {
     // gravity + integration + walls (cheap, serial)
     for (Body& b : bodies_) {
         b.vel.y -= kGravity * h;
@@ -137,7 +137,10 @@ void World::SubStep(float h) {
     // cell, so two cells that are >= 3 apart on some axis never share a body. Cells are grouped by
     // (x%3, y%3, z%3) into 27 colours; the cells of one colour run in parallel, colours run one
     // after another. No locks or atomics needed, and the result does not depend on thread timing.
-    for (int color = 0; color < 27; ++color) {
+    // Every other substep goes through the colours backwards: always sweeping the same way pushes the bodies a
+    // little in one direction on average.
+    for (int pass = 0; pass < 27; ++pass) {
+        const int color = reverse ? 26 - pass : pass;
         const int ox = color % 3, oy = (color / 3) % 3, oz = color / 9;
         const int cxn = (NX - ox + 2) / 3, cyn = (NY - oy + 2) / 3, czn = (NZ - oz + 2) / 3;
         const int cells = cxn * cyn * czn;
@@ -162,7 +165,7 @@ void World::SubStep(float h) {
 
 void World::Step(float dt) {
     float h = dt / kSubSteps;
-    for (int s = 0; s < kSubSteps; ++s) SubStep(h);
+    for (int s = 0; s < kSubSteps; ++s) SubStep(h, s % 2 == 1);
 }
 
 void World::BuildInstances(std::vector<Instance> out[4]) const {

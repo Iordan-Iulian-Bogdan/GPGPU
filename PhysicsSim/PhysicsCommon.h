@@ -9,8 +9,10 @@ namespace phys {
 inline constexpr float kGravity = 9.81f;
 inline constexpr float kRestitution = 0.35f;
 inline constexpr float kFriction = 0.4f;
-inline constexpr float kSlop = 0.005f;
-inline constexpr float kCorrection = 0.8f;
+// Positional correction: overlap up to kSlop is tolerated and only a fraction of the rest is removed per pass.
+// Removing (nearly) all of it at once makes the pairs of a pile overshoot one another, which shows as jitter.
+inline constexpr float kSlop = 0.01f;
+inline constexpr float kCorrection = 0.5f;
 inline constexpr float kPi = 3.14159265f;
 inline constexpr int kSubSteps = 2;
 
