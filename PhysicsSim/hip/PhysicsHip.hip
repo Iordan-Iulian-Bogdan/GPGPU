@@ -1,15 +1,18 @@
 // AMD HIP backend of the physics. Built as PhysicsHip.dll (see build_hip.bat) and loaded at run time by the
 // app, so everything still works on a PC without a HIP SDK / AMD GPU.
 //
-// The GPU runs the same algorithm as the CPU worlds, with the same collision code (PhysicsCommon.h,
-// AabbCollision.h and ObbCollision.h are compiled for both). One frame = kSubSteps substeps, and each substep is
-//   1. GridKernel      gravity, integration, rotation, walls (one thread per body), then the uniform grid by
-//                      counting sort (one work-group); each cell's list is ordered by body index
-//   2. PairsKernel x27 the pair solver. Like the OpenMP version it is a sequential-impulse solver, so parallelism
-//                      comes from grid colouring: the cells of one colour are >= 3 cells apart and never touch the
-//                      same body, so a launch handles all cells of one colour at once, and the 27 colours follow
-//                      one another in the stream. One WAVE per cell: it walks the cell's body pairs in lockstep,
-//                      and for a pair of cones / cylinders the lanes split the (up to 64 x 64) part pairs.
+// The GPU uses the same collision code as the CPU worlds (PhysicsCommon.h, AabbCollision.h and ObbCollision.h are
+// compiled for both) and the same kind of solver, but splits the work so that the expensive part runs on the whole
+// GPU at once. One frame = kSubSteps substeps, and each substep is
+//   1. IntegrateKernel  gravity, integration, rotation, walls: one thread per body
+//   2. GridKernel       the uniform grid by counting sort (one work-group); cell lists ordered by body index
+//   3. NarrowKernel     contact detection, ALL bodies at the same time, one wave per body: the lanes scan the 27
+//                       neighbour cells, then work out the contacts of the body's pairs (for cones / cylinders the
+//                       lanes share the up to 64 x 64 part pairs). Read only: it sees the bodies as they are after
+//                       integration and writes a contact list per body.
+//   4. SolveKernel x27  the sequential-impulse solver over those contacts, which is cheap. It has to respect an
+//                       order, so parallelism comes from grid colouring like in the OpenMP version: the cells of one
+//                       colour are >= 3 cells apart and never touch the same body. One thread per cell.
 // The launches are queued without waiting; the host synchronises once per frame.
 #include <hip/hip_runtime.h>
 
@@ -31,6 +34,16 @@ using namespace phys;
 
 namespace {
 constexpr int kGridBlock = 256;   // threads of the grid work-group
+constexpr int kCand = 32;         // partners remembered per neighbour cell while scanning
+constexpr int kMaxPairs = 64;     // pairs a body can own (partners beyond that are ignored: never seen in practice)
+
+// Contact of a pair as found by the narrow phase. The solver moves the bodies while it works through the pairs, so
+// the contact is stored relative to them: the point relative to body a, and the separation along the normal at
+// detection time, from which the current depth follows.
+struct PairContact {
+    float nx, ny, nz, depth;   // depth <= 0: no contact
+    float rx, ry, rz, sep;     // contact point - a.pos; Dot(n, b.pos - a.pos) at detection
+};
 constexpr int kColors = 27;
 
 char g_error[256] = "";
@@ -54,6 +67,9 @@ struct Sim {
     int* cellCursor = nullptr;   // fill counter while scattering
     int* cellOfBody = nullptr;
     int* sorted = nullptr;       // body indices grouped by cell
+    int* pairCount = nullptr;    // per body: number of pairs it owns (partners with a larger index)
+    int* pairBody = nullptr;     // per body: kMaxPairs partner indices
+    PairContact* contacts = nullptr;   // OBB: the contact of each of those pairs
     int capacity = 0, count = 0;
     hipEvent_t start = nullptr, stop = nullptr;
     char name[256] = "";
@@ -147,84 +163,140 @@ __device__ inline bool CouldTouch(const Body& a, const Body& b, int obbMode) {
     return a.half.x + b.half.x > fabsf(d.x) && a.half.y + b.half.y > fabsf(d.y) && a.half.z + b.half.z > fabsf(d.z);
 }
 
-// ---- substep part 2: the pair solver for the cells of one colour; one wave (work-group) per cell ----
-// For every body of the cell the 27 lanes first scan the 27 neighbour cells at the same time (read only) and note the
-// bodies that could touch it; then the wave resolves those pairs one after another in the order of the cell loops
-// (dz, dy, dx) of the CPU version. Scanning is where nearly all the time went: it is a long chain of dependent
-// loads when done by one lane, but cheap when each lane does one cell. The scan sees the body as it was before its
-// first pair of this sweep; a pair that only starts to overlap because of an earlier push in the same sweep is
-// caught in the next substep.
-constexpr int kCand = 32;   // candidates remembered per neighbour cell (a rare excess takes a slower path)
-
-__global__ __launch_bounds__(obb::kWave) void PairsKernel(Body* bodies, int obbMode, Grid g, int color,
-                                                          const int* cellCount, const int* cellStart,
-                                                          const int* sorted) {
+// ---- substep part 2: contact detection, one wave (work-group) per body, all bodies in parallel ----
+// Body i owns its pairs with the bodies j > i of the 27 cells around it. The lanes scan one neighbour cell each (a
+// long chain of dependent loads when one lane does it all), the hits are packed into the body's pair list in lane
+// order, so the list does not depend on timing. AABB stops there (its contact test is trivial and is done by the
+// solver). OBB works out the contacts: cheap pairs (spheres, cubes) one per lane, pairs with many part pairs
+// (cones, cylinders) one after another with all the lanes cooperating.
+__global__ __launch_bounds__(obb::kWave) void NarrowKernel(const Body* bodies, int obbMode, Grid g,
+                                                           const int* cellCount, const int* cellStart,
+                                                           const int* sorted, const int* cellOfBody, int* pairCount,
+                                                           int* pairBody, PairContact* contacts) {
     // shared storage of the OBB part pairs (raw bytes, Box has a constructor)
     __shared__ char partStore[obb::WaveScratch::kBytes] __attribute__((aligned(16)));
     __shared__ int candCount[obb::kWave];
     __shared__ int cand[27][kCand];
+    __shared__ int list[kMaxPairs];
     obb::WaveScratch scratch = obb::WaveScratch::Carve(partStore);
 
     const int lane = threadIdx.x;
+    const int i = sorted[blockIdx.x];   // in cell order: neighbouring waves read the same memory
+    const int own = cellOfBody[i];
+    const int cx = own % g.nx, cy = own / g.nx % g.ny, cz = own / (g.nx * g.ny);
+    const Body mine = bodies[i];
+
+    // 1. gather the partners, one neighbour cell per lane
+    int found = 0;
+    if (lane < 27) {
+        const int x = cx + lane % 3 - 1, y = cy + lane / 3 % 3 - 1, z = cz + lane / 9 - 1;
+        if (x >= 0 && y >= 0 && z >= 0 && x < g.nx && y < g.ny && z < g.nz) {
+            const int c = (z * g.ny + y) * g.nx + x;
+            const int* cell = sorted + cellStart[c];
+            const int cnt = cellCount[c];
+            for (int ja = 0; ja < cnt && found < kCand; ++ja) {
+                const int j = cell[ja];
+                if (j > i && CouldTouch(mine, bodies[j], obbMode)) cand[lane][found++] = j;
+            }
+        }
+    }
+    candCount[lane] = found;
+    if (obbMode) obb::PrepareA(mine, scratch);   // the parts of this body, once for all its pairs
+    __syncthreads();
+
+    // 2. pack them in lane order
+    int before = 0, total = 0;
+    for (int l = 0; l < 27; ++l) {
+        if (l < lane) before += candCount[l];
+        total += candCount[l];
+    }
+    total = min(total, kMaxPairs);
+    for (int m = 0; m < found && before + m < kMaxPairs; ++m) {
+        list[before + m] = cand[lane][m];
+        pairBody[i * kMaxPairs + before + m] = cand[lane][m];
+    }
+    if (lane == 0) pairCount[i] = total;
+    if (!obbMode) return;
+    __syncthreads();
+
+    // 3. the contacts
+    PairContact* out = contacts + i * kMaxPairs;
+    auto pack = [&](const Body& b, const obb::Contact& c, bool hit) {
+        PairContact pc;
+        pc.nx = c.n.x; pc.ny = c.n.y; pc.nz = c.n.z;
+        pc.depth = hit ? c.depth : 0.0f;
+        const Vec3 r = c.p - mine.pos;
+        pc.rx = r.x; pc.ry = r.y; pc.rz = r.z;
+        pc.sep = Dot(c.n, b.pos - mine.pos);
+        return pc;
+    };
+    const int na = obb::PartCount(mine);
+    bool anyBig = false;
+    for (int k = lane; k < total; k += obb::kWave) {   // cheap pairs: one per lane
+        const Body b = bodies[list[k]];
+        if (na * obb::PartCount(b) > obb::kSmallTotal) {
+            anyBig = true;
+            continue;
+        }
+        obb::Contact c;
+        const bool hit = ObbContact(mine, b, c);
+        out[k] = pack(b, c, hit);
+    }
+    if (__ballot(anyBig) == 0) return;
+    for (int k = 0; k < total; ++k) {   // pairs with many part pairs: the whole wave on one pair
+        const Body b = bodies[list[k]];
+        if (na * obb::PartCount(b) <= obb::kSmallTotal) continue;
+        obb::Contact c;
+        const bool hit = obb::ObbContactWave(mine, b, scratch, c);
+        if (lane == 0) out[k] = pack(b, c, hit);
+    }
+}
+
+// ---- substep part 3: the solver for the cells of one colour, one thread per cell ----
+// Walks the pairs owned by the bodies of the cell in a fixed order and applies positional correction and impulses.
+// The partners are in the 27 cells around, which no other cell of this colour touches.
+__global__ void SolveKernel(Body* bodies, int obbMode, Grid g, int color, const int* cellCount, const int* cellStart,
+                            const int* sorted, const int* pairCount, const int* pairBody,
+                            const PairContact* contacts) {
     const int ox = color % 3, oy = (color / 3) % 3, oz = color / 9;
-    const int cxn = (g.nx - ox + 2) / 3, cyn = (g.ny - oy + 2) / 3;
-    const int idx = blockIdx.x;
+    const int cxn = (g.nx - ox + 2) / 3, cyn = (g.ny - oy + 2) / 3, czn = (g.nz - oz + 2) / 3;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= cxn * cyn * czn) return;
     const int cx = ox + (idx % cxn) * 3;
     const int cy = oy + ((idx / cxn) % cyn) * 3;
     const int cz = oz + (idx / (cxn * cyn)) * 3;
     const int own = (cz * g.ny + cy) * g.nx + cx;
 
-    // neighbour cell of a lane (lanes 0..26 map to dx, dy, dz in the same order as the CPU loops), -1 = outside
-    auto neighbour = [&](int l) {
-        const int x = cx + l % 3 - 1, y = cy + l / 3 % 3 - 1, z = cz + l / 9 - 1;
-        return (x < 0 || y < 0 || z < 0 || x >= g.nx || y >= g.ny || z >= g.nz) ? -1 : (z * g.ny + y) * g.nx + x;
-    };
-    auto resolve = [&](Body& a, Body& b) {
-        // every lane resolves the same pair (identical writes); the OBB test shares the part pairs out
-        if (obbMode) obb::ObbResolveWave(a, b, scratch);
-        else AabbResolve(a, b);
-    };
-    const int myNeighbour = lane < 27 ? neighbour(lane) : -1;
-
-    for (int ia = 0; ia < cellCount[own]; ++ia) {
-        const int i = sorted[cellStart[own] + ia];
-        Body mine = bodies[i];   // this wave owns the whole neighbourhood during the colour, so a copy is safe
-        if (obbMode) obb::PrepareA(mine, scratch);   // its parts, once for all the pairs of this sweep
-
-        // 1. gather the candidates, one neighbour cell per lane
-        int found = 0;
-        if (myNeighbour >= 0) {
-            const int* list = sorted + cellStart[myNeighbour];
-            const int cnt = cellCount[myNeighbour];
-            for (int ja = 0; ja < cnt; ++ja) {
-                const int j = list[ja];
-                if (j <= i || !CouldTouch(mine, bodies[j], obbMode)) continue;
-                if (found < kCand) cand[lane][found] = j;
-                ++found;
+    const int first = cellStart[own], cnt = cellCount[own];
+    for (int ia = 0; ia < cnt; ++ia) {
+        const int i = sorted[first + ia];
+        const int pairs = pairCount[i];
+        if (pairs == 0) continue;
+        Body a = bodies[i];
+        for (int k = 0; k < pairs; ++k) {
+            const int j = pairBody[i * kMaxPairs + k];
+            if (obbMode) {
+                const PairContact c = contacts[i * kMaxPairs + k];
+                if (c.depth <= 0) continue;
+                Body b = bodies[j];
+                // earlier pairs of this sweep may have moved the two bodies: the depth follows the separation
+                const Vec3 n(c.nx, c.ny, c.nz);
+                const float depth = c.depth + c.sep - Dot(n, b.pos - a.pos);
+                if (depth <= 0) continue;
+                const Vec3 p = a.pos + Vec3(c.rx, c.ry, c.rz);
+                SeparateBodies(a, b, n, depth);
+                obb::ContactImpulse(a, b, n, p);
+                bodies[j] = b;
+            } else {
+                Body b = bodies[j];
+                AabbResolve(a, b);
+                bodies[j] = b;
             }
         }
-        candCount[lane] = found;
-        __syncthreads();
-
-        // 2. resolve them in lane order
-        for (int l = 0; l < 27; ++l) {
-            const int total = candCount[l];
-            for (int k = 0; k < total && k < kCand; ++k) resolve(mine, bodies[cand[l][k]]);
-            if (total > kCand) {   // rare: walk the cell again, past the candidates already handled
-                const int* list = sorted + cellStart[neighbour(l)];
-                const int cnt = cellCount[neighbour(l)];
-                int seen = 0;
-                for (int ja = 0; ja < cnt; ++ja) {
-                    const int j = list[ja];
-                    if (j <= i || !CouldTouch(mine, bodies[j], obbMode)) continue;
-                    if (seen++ >= kCand) resolve(mine, bodies[j]);
-                }
-            }
-        }
-        bodies[i] = mine;
-        __syncthreads();   // before the next body overwrites cand / candCount
+        bodies[i] = a;
     }
 }
+
 // ---- queueing one substep (asynchronous) ----
 void LaunchGrid(Sim* s, float h, int obbMode) {
     IntegrateKernel<<<(s->count + 63) / 64, 64>>>(s->bodies, s->count, h, obbMode);
@@ -232,18 +304,30 @@ void LaunchGrid(Sim* s, float h, int obbMode) {
                                   s->cellCursor, s->cellOfBody, s->sorted);
 }
 
-void LaunchPairs(Sim* s, int obbMode) {
+void LaunchNarrow(Sim* s, int obbMode) {
+    NarrowKernel<<<s->count, obb::kWave>>>(s->bodies, obbMode, GridFor(obbMode != 0), s->cellCount, s->cellStart,
+                                           s->sorted, s->cellOfBody, s->pairCount, s->pairBody, s->contacts);
+}
+
+void LaunchSolve(Sim* s, int obbMode) {
     const Grid g = GridFor(obbMode != 0);
     for (int color = 0; color < kColors; ++color) {
         const int ox = color % 3, oy = color / 3 % 3, oz = color / 9;
         const int cells = ((g.nx - ox + 2) / 3) * ((g.ny - oy + 2) / 3) * ((g.nz - oz + 2) / 3);
-        PairsKernel<<<cells, obb::kWave>>>(s->bodies, obbMode, g, color, s->cellCount, s->cellStart, s->sorted);
+        SolveKernel<<<(cells + 63) / 64, 64>>>(s->bodies, obbMode, g, color, s->cellCount, s->cellStart, s->sorted,
+                                               s->pairCount, s->pairBody, s->contacts);
     }
 }
 
 void LaunchSubStep(Sim* s, float h, int obbMode) {
     LaunchGrid(s, h, obbMode);
-    LaunchPairs(s, obbMode);
+    LaunchNarrow(s, obbMode);
+    LaunchSolve(s, obbMode);
+}
+
+void FreeAll(Sim* s) {
+    Free(s->bodies); Free(s->cellCount); Free(s->cellStart); Free(s->cellCursor);
+    Free(s->cellOfBody); Free(s->sorted); Free(s->pairCount); Free(s->pairBody); Free(s->contacts);
 }
 }  // namespace
 
@@ -272,11 +356,13 @@ PH_EXPORT void* ph_create(int capacity, char* nameOut, int nameLen) {
               Check(hipMalloc(&s->cellCursor, sizeof(int) * kMaxCells), "hipMalloc cellCursor") &&
               Check(hipMalloc(&s->cellOfBody, sizeof(int) * capacity), "hipMalloc cellOfBody") &&
               Check(hipMalloc(&s->sorted, sizeof(int) * capacity), "hipMalloc sorted") &&
+              Check(hipMalloc(&s->pairCount, sizeof(int) * capacity), "hipMalloc pairCount") &&
+              Check(hipMalloc(&s->pairBody, sizeof(int) * capacity * kMaxPairs), "hipMalloc pairBody") &&
+              Check(hipMalloc(&s->contacts, sizeof(PairContact) * capacity * kMaxPairs), "hipMalloc contacts") &&
               Check(hipEventCreate(&s->start), "hipEventCreate") && Check(hipEventCreate(&s->stop), "hipEventCreate") &&
               Check(hipDeviceGetName(s->name, sizeof s->name, 0), "hipDeviceGetName");
     if (!ok) {
-        Free(s->bodies); Free(s->cellCount); Free(s->cellStart); Free(s->cellCursor);
-        Free(s->cellOfBody); Free(s->sorted);
+        FreeAll(s);
         delete s;
         return nullptr;
     }
@@ -287,8 +373,7 @@ PH_EXPORT void* ph_create(int capacity, char* nameOut, int nameLen) {
 PH_EXPORT void ph_destroy(void* handle) {
     Sim* s = static_cast<Sim*>(handle);
     if (!s) return;
-    Free(s->bodies); Free(s->cellCount); Free(s->cellStart); Free(s->cellCursor);
-    Free(s->cellOfBody); Free(s->sorted);
+    FreeAll(s);
     (void)hipEventDestroy(s->start);
     (void)hipEventDestroy(s->stop);
     delete s;
@@ -322,29 +407,33 @@ PH_EXPORT int ph_step(void* handle, float h, int substeps, int obbMode, float* g
     return 1;
 }
 
-// Profiling aid (not used by the app): like ph_step, but reports how long the grid kernels and the 27 pair
-// launches took in total.
-PH_EXPORT int ph_profile(void* handle, float h, int substeps, int obbMode, float* gridMs, float* pairsMs) {
+// Profiling aid (not used by the app): like ph_step, but reports how long the three phases took in total.
+PH_EXPORT int ph_profile(void* handle, float h, int substeps, int obbMode, float* gridMs, float* narrowMs,
+                         float* solveMs) {
     Sim* s = static_cast<Sim*>(handle);
-    *gridMs = *pairsMs = 0;
+    *gridMs = *narrowMs = *solveMs = 0;
     if (s->count == 0 || substeps < 1 || substeps > 4) return 0;
-    hipEvent_t ev[9];
+    hipEvent_t ev[13];
     for (auto& e : ev)
         if (!Check(hipEventCreate(&e), "hipEventCreate")) return 0;
     (void)hipEventRecord(ev[0]);
     for (int step = 0; step < substeps; ++step) {
         LaunchGrid(s, h, obbMode);
-        (void)hipEventRecord(ev[2 * step + 1]);
-        LaunchPairs(s, obbMode);
-        (void)hipEventRecord(ev[2 * step + 2]);
+        (void)hipEventRecord(ev[3 * step + 1]);
+        LaunchNarrow(s, obbMode);
+        (void)hipEventRecord(ev[3 * step + 2]);
+        LaunchSolve(s, obbMode);
+        (void)hipEventRecord(ev[3 * step + 3]);
     }
-    bool ok = Check(hipEventSynchronize(ev[2 * substeps]), "profile");
+    bool ok = Check(hipEventSynchronize(ev[3 * substeps]), "profile");
     for (int step = 0; ok && step < substeps; ++step) {
-        float g = 0, p = 0;
-        (void)hipEventElapsedTime(&g, ev[2 * step], ev[2 * step + 1]);
-        (void)hipEventElapsedTime(&p, ev[2 * step + 1], ev[2 * step + 2]);
+        float g = 0, n = 0, p = 0;
+        (void)hipEventElapsedTime(&g, ev[3 * step], ev[3 * step + 1]);
+        (void)hipEventElapsedTime(&n, ev[3 * step + 1], ev[3 * step + 2]);
+        (void)hipEventElapsedTime(&p, ev[3 * step + 2], ev[3 * step + 3]);
         *gridMs += g;
-        *pairsMs += p;
+        *narrowMs += n;
+        *solveMs += p;
     }
     for (auto& e : ev) (void)hipEventDestroy(e);
     return ok;

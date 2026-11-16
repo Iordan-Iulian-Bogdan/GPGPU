@@ -1,8 +1,8 @@
 #pragma once
-// GPU only (HIP): ObbResolve for a whole wave. All lanes of the wave call it with the SAME pair of bodies. The part
+// GPU only (HIP): ObbContact for a whole wave. All lanes of the wave call it with the SAME pair of bodies. The part
 // pairs of a cone / cylinder (up to 64 x 64) are tested by all lanes together and only the overlapping ones are
 // kept (in a deterministic order), then the lanes work out those contacts at once and combine the results with
-// shuffles. Same result as ObbResolve up to the order of the floating point sums.
+// shuffles. Same result as ObbContact up to the order of the floating point sums.
 //
 // Everything is computed in a frame whose origin is the centre of body a, so the parts of a (which do not change
 // while a is being swept against its neighbours) are generated only once per sweep: PrepareA.
@@ -13,7 +13,7 @@
 namespace phys {
 namespace obb {
 inline constexpr int kWave = 32;           // lanes that cooperate on one pair (the work-group size)
-inline constexpr int kSmallTotal = 32;     // up to this many part pairs every lane just does the scalar version
+inline constexpr int kSmallTotal = 32;     // up to this many part pairs one lane does the pair alone (ObbContact)
 inline constexpr int kMaxHits = 512;       // overlapping part pairs kept per body pair (the rest is ignored)
 
 struct HitData {
@@ -98,24 +98,20 @@ __device__ inline void LocalPart(const Body& body, int k, Vec3 centre, Box& box,
 }
 
 // The parts of body a, once per sweep (a's orientation does not change while its pairs are resolved). All lanes
-// call it; a barrier is needed before ObbResolveWave uses them.
+// call it; a barrier is needed before ObbContactWave uses them.
 __device__ inline void PrepareA(const Body& a, WaveScratch& s) {
     const int lane = threadIdx.x % kWave, na = PartCount(a);
     for (int i = lane; i < na; i += kWave) LocalPart(a, i, Vec3(0, 0, 0), s.a[i], s.ra[i]);
 }
 
-__device__ inline void ObbResolveWave(Body& a, Body& b, WaveScratch& s) {
+// The contact of a and b (world space), the same value in every lane. False if they do not overlap.
+__device__ inline bool ObbContactWave(const Body& a, const Body& b, WaveScratch& s, Contact& c) {
     // cheap reject: bounding spheres (radius = half diagonal) must overlap first
     const Vec3 d = b.pos - a.pos;
     const float rr = Length(a.half) + Length(b.half);
-    if (Dot(d, d) >= rr * rr) return;
+    if (Dot(d, d) >= rr * rr) return false;
 
     const int na = PartCount(a), nb = PartCount(b);
-    if (na * nb <= kSmallTotal) {   // sphere / cube / cylinder-cube...: not worth sharing, all lanes do the same
-        ObbResolve(a, b);
-        return;
-    }
-
     const int lane = threadIdx.x % kWave;
     __syncthreads();   // the previous pair may still be reading s.b / s.hit
     for (int j = lane; j < nb; j += kWave) LocalPart(b, j, d, s.b[j], s.rb[j]);
@@ -163,10 +159,9 @@ __device__ inline void ObbResolveWave(Body& a, Body& b, WaveScratch& s) {
     nSum = {WaveSum(nSum.x), WaveSum(nSum.y), WaveSum(nSum.z)};
     pSum = {WaveSum(pSum.x), WaveSum(pSum.y), WaveSum(pSum.z)};
     wSum = WaveSum(wSum);
-    if (wSum < 1e-9f) return;   // no real overlap (same guard as ObbResolve)
+    if (wSum < 1e-9f) return false;   // no real overlap (same guard as ObbContact)
     __syncthreads();            // the hit data written by the other lanes is read below
 
-    Contact c;
     const float nl = Length(nSum);
     if (nl > 1e-6f) {
         c.n = nSum * (1.0f / nl);
@@ -183,10 +178,7 @@ __device__ inline void ObbResolveWave(Body& a, Body& b, WaveScratch& s) {
         if (t.depth > 0) depth = fmaxf(depth, t.depth * fmaxf(0.0f, t.nx * c.n.x + t.ny * c.n.y + t.nz * c.n.z));
     }
     c.depth = WaveMax(depth);
-
-    // every lane applies the same response to the same bodies (identical values, so the writes agree)
-    SeparateBodies(a, b, c.n, c.depth);
-    ContactImpulse(a, b, c.n, c.p);
+    return true;
 }
 }  // namespace obb
 }  // namespace phys

@@ -262,13 +262,13 @@ PHYS_HD inline void ObbUpdateBody(Body& b, float h) {
     BounceOffWalls(b, obb::WorldExtent(b));   // walls act on the box's axis-aligned extent: no tipping from walls
 }
 
-// One pair of bodies: contact test (all part pairs), positional correction, impulse with torque and friction.
-PHYS_HD inline void ObbResolve(Body& a, Body& b) {
+// Contact test of one pair of bodies (all part pairs). False if they do not overlap.
+PHYS_HD inline bool ObbContact(const Body& a, const Body& b, obb::Contact& c) {
     using namespace obb;
     // cheap reject: bounding spheres (radius = half diagonal) must overlap first
     Vec3 d = b.pos - a.pos;
     float r = Length(a.half) + Length(b.half);
-    if (Dot(d, d) >= r * r) return;
+    if (Dot(d, d) >= r * r) return false;
 
     // test every part of a against every part of b and keep the deepest contact
     const Parts pa = MakeParts(a), pb = MakeParts(b);
@@ -294,13 +294,20 @@ PHYS_HD inline void ObbResolve(Body& a, Body& b) {
         }
     // wSum is the sum of the depths; without a real overlap (e.g. a resting sphere that exactly touches a box
     // has depth 0) the weighted averages below would divide by zero and put NaN into the simulation.
-    if (nHits == 0 || wSum < 1e-9f) return;
-    Contact c;
+    if (nHits == 0 || wSum < 1e-9f) return false;
+    c.depth = 0;
     const float nl = Length(nSum);
     c.n = nl > 1e-6f ? nSum * (1.0f / nl) : hits[0].n;
     c.p = pSum * (1.0f / wSum);
     for (int k = 0; k < nHits; ++k) c.depth = std::max(c.depth, hits[k].depth * std::max(0.0f, Dot(hits[k].n, c.n)));
+    return true;
+}
+
+// One pair of bodies: contact test, positional correction, impulse with torque and friction.
+PHYS_HD inline void ObbResolve(Body& a, Body& b) {
+    obb::Contact c;
+    if (!ObbContact(a, b, c)) return;
     SeparateBodies(a, b, c.n, c.depth);
-    ContactImpulse(a, b, c.n, c.p);
+    obb::ContactImpulse(a, b, c.n, c.p);
 }
 }  // namespace phys
